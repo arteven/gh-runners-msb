@@ -52,7 +52,7 @@ func Run(ctx context.Context, sb *microsandbox.Sandbox, jitConfig string, out io
 	if err := stdin.Close(); err != nil {
 		return 0, fmt.Errorf("close stdin: %w", err)
 	}
-	return drain(ctx, h, out)
+	return drain(ctx, h, out, out)
 }
 
 // SelfTest runs the Self-test checks in sb: Docker ready, docker info as
@@ -69,11 +69,41 @@ func SelfTest(ctx context.Context, sb *microsandbox.Sandbox, out io.Writer) (int
 		return 0, fmt.Errorf("start self-test script: %w", err)
 	}
 	defer h.Close()
-	return drain(ctx, h, out)
+	return drain(ctx, h, out, out)
 }
 
-// drain copies the script's output to out until it is done.
-func drain(ctx context.Context, h *microsandbox.ExecHandle, out io.Writer) (int, error) {
+// CopyDiagnostics streams dockerd's log and the Runner's _diag directory out of
+// sb as a tar archive on archive; tar's own stderr goes to errs. A missing path
+// is not a failure (--ignore-failed-read): the fake runner and early failures
+// have no _diag. It returns an error when the exec failed or tar exited
+// non-zero. The in-VM paths live only here: /tmp/dockerd.log is written by
+// prelude.sh, and /home/runner/_diag is the actions-runner's diagnostics dir.
+//
+// It runs as root through sudo, as the prelude does, because a job may leave
+// root-owned files in _diag. The archive is untrusted: a job can replace tar.
+func CopyDiagnostics(ctx context.Context, sb *microsandbox.Sandbox, archive, errs io.Writer) error {
+	h, err := sb.ExecStream(ctx, "sudo", []string{"-n", "tar", "-cf", "-", "--ignore-failed-read",
+		"-C", "/tmp", "dockerd.log", "-C", "/home/runner", "_diag"},
+		microsandbox.WithExecUser("runner"),
+		microsandbox.WithExecCwd("/home/runner"),
+	)
+	if err != nil {
+		return fmt.Errorf("start diagnostics copy: %w", err)
+	}
+	defer h.Close()
+	code, err := drain(ctx, h, archive, errs)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("tar exited with status %d", code)
+	}
+	return nil
+}
+
+// drain copies the script's stdout to stdout and stderr to stderr until it is
+// done.
+func drain(ctx context.Context, h *microsandbox.ExecHandle, stdout, stderr io.Writer) (int, error) {
 	code := 0
 	for {
 		ev, err := h.Recv(ctx)
@@ -81,8 +111,10 @@ func drain(ctx context.Context, h *microsandbox.ExecHandle, out io.Writer) (int,
 			return 0, fmt.Errorf("guest script: %w", err)
 		}
 		switch ev.Kind {
-		case microsandbox.ExecEventStdout, microsandbox.ExecEventStderr:
-			out.Write(ev.Data)
+		case microsandbox.ExecEventStdout:
+			stdout.Write(ev.Data)
+		case microsandbox.ExecEventStderr:
+			stderr.Write(ev.Data)
 		case microsandbox.ExecEventExited:
 			code = ev.ExitCode
 		case microsandbox.ExecEventFailed:

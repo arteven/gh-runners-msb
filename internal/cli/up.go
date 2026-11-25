@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/arteven/gh-runners-msb/internal/github"
 	"github.com/arteven/gh-runners-msb/internal/identity"
 	"github.com/arteven/gh-runners-msb/internal/pool"
+	"github.com/arteven/gh-runners-msb/internal/runlog"
 	"github.com/arteven/gh-runners-msb/internal/size"
 	"github.com/arteven/gh-runners-msb/internal/spec"
 )
@@ -26,6 +28,7 @@ func newUpCmd() *cobra.Command {
 		repoFlag string
 		slots    int
 		label    string
+		logs     string
 
 		allowPublic bool
 
@@ -48,13 +51,14 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runUp(cmd, upOptions{repo: repoFlag, slots: slots, label: label, sizes: sizes, allowPublic: allowPublic})
+			return runUp(cmd, upOptions{repo: repoFlag, slots: slots, label: label, sizes: sizes, allowPublic: allowPublic, logs: logs})
 		},
 	}
 	f := cmd.Flags()
 	f.StringVarP(&repoFlag, "repo", "R", "", "repository as [HOST/]OWNER/REPO (default: current repository)")
 	f.IntVar(&slots, "slots", 5, "number of runners to keep ready")
 	f.StringVar(&label, "label", defaultLabel, "runner label that jobs target in runs-on")
+	f.StringVar(&logs, "logs", "", "directory for runner logs (default: <user cache dir>/gh-runners-msb/logs)")
 	f.BoolVar(&allowPublic, "allow-public-repo", false, "allow a public repository (fork PRs could run code on your machine)")
 	f.IntVar(&cpus, "cpus", int(spec.Defaults.CPUs), "virtual CPUs per runner")
 	f.StringVar(&memory, "memory", "4G", "memory per runner (e.g. 4G, 512MiB)")
@@ -96,6 +100,7 @@ type upOptions struct {
 	slots int
 	label string
 	sizes spec.Sizes
+	logs  string // empty: runlog.DefaultDir
 
 	allowPublic bool
 }
@@ -118,6 +123,11 @@ func runUp(cmd *cobra.Command, o upOptions) error {
 		return fmt.Errorf("reading install ID: %w", err)
 	}
 	id := identity.NewPool(installID, repo.Host+"/"+repo.Owner+"/"+repo.Name, o.label)
+
+	logDir, err := resolveLogDir(o.logs)
+	if err != nil {
+		return err
+	}
 
 	backend, err := resolveBackend()
 	if err != nil {
@@ -145,6 +155,7 @@ func runUp(cmd *cobra.Command, o upOptions) error {
 		GitHub:    gh,
 		Backend:   backend,
 		Sandboxes: sandboxes,
+		LogDir:    logDir,
 		Out:       cmd.OutOrStdout(),
 		Err:       cmd.ErrOrStderr(),
 	})
@@ -170,4 +181,22 @@ func resolveRepo(flag string) (repository.Repository, error) {
 // displayRepo is OWNER/REPO; checkHost has already limited repo to github.com.
 func displayRepo(r repository.Repository) string {
 	return r.Owner + "/" + r.Name
+}
+
+// resolveLogDir is --logs when given, else the default under the user cache
+// dir, made absolute so the paths in messages are usable from anywhere. The
+// directory itself is created by pool.Run.
+func resolveLogDir(flag string) (string, error) {
+	dir := flag
+	if dir == "" {
+		var err error
+		if dir, err = runlog.DefaultDir(); err != nil {
+			return "", fmt.Errorf("locating log dir (use --logs): %w", err)
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("--logs: %w", err)
+	}
+	return abs, nil
 }

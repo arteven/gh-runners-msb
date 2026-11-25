@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -72,4 +74,29 @@ func TestParseSizes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveLogDir(t *testing.T) {
+	if f := newUpCmd().Flags().Lookup("logs"); f == nil || f.DefValue != "" {
+		t.Fatalf("--logs flag = %v, want one defaulting to empty", f)
+	}
+	got, err := resolveLogDir("rel/logs")
+	if err != nil || !filepath.IsAbs(got) || !strings.HasSuffix(got, filepath.FromSlash("rel/logs")) {
+		t.Errorf("resolveLogDir(rel/logs) = %q, %v; want an absolute path", got, err)
+	}
+	t.Setenv("XDG_CACHE_HOME", "/cache")
+	t.Setenv("HOME", "/home/x")
+	got, err = resolveLogDir("")
+	if err != nil || got != filepath.Join(userCache(t), "gh-runners-msb", "logs") {
+		t.Errorf("resolveLogDir(\"\") = %q, %v", got, err)
+	}
+}
+
+func userCache(t *testing.T) string {
+	t.Helper()
+	d, err := os.UserCacheDir()
+	if err != nil {
+		t.Skip(err)
+	}
+	return d
 }
