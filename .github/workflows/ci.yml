@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  # No branch filter: PRs into stacked parent branches run too, not only master.
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    env:
+      # The msb SDK needs cgo; never build without it.
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+      - name: Build
+        run: go build -ldflags "-X main.version=v0.0.0-ci" -o gh-runners-msb .
+
+      - name: Smoke --version (proves ldflags stamping and FFI load)
+        run: |
+          out=$(./gh-runners-msb --version)
+          echo "$out"
+          grep -q 'v0.0.0-ci' <<<"$out"
+
+      - name: Smoke as a gh extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh extension install .
+          gh runners-msb --version
