@@ -1,0 +1,146 @@
+# Builds, checks and publishes the Runner image (ADR-0002).
+# resolve -> check (native amd64 + arm64) -> publish (never on pull_request).
+name: image
+
+on:
+  push:
+    branches: [master]
+    paths: ['image/**', '.github/workflows/image.yml']
+  pull_request:
+    paths: ['image/**', '.github/workflows/image.yml']
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# A push build and the daily build must not race and leave :1 on the older one.
+# PR runs get their own group: a queued PR run would otherwise replace a
+# pending publishing run in the shared group.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('image-pr-{0}', github.ref) || 'image-publish' }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/arteven/gh-runners-msb
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/actions/runner/releases/latest --jq .tag_name)
+          v=${tag#v}
+          echo "Latest actions-runner release: $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          build=true
+          # A release can appear before its image is published.
+          if ! docker buildx imagetools inspect "ghcr.io/actions/actions-runner:$v" >/dev/null 2>&1; then
+            if [ "$EVENT" = schedule ]; then
+              echo "::notice::Base tag actions-runner:$v not published yet; skipping, tomorrow's run picks it up."
+              build=false
+            else
+              echo "::error::Base tag ghcr.io/actions/actions-runner:$v does not exist."
+              exit 1
+            fi
+          fi
+          if [ "$build" = true ] && [ "$EVENT" = schedule ] \
+            && docker buildx imagetools inspect "$IMAGE:1-$v" >/dev/null 2>&1; then
+            echo "::notice::Runner image $IMAGE:1-$v already published, skipping."
+            build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: image
+          platforms: ${{ matrix.platform }}
+          build-args: RUNNER_VERSION=${{ needs.resolve.outputs.version }}
+          load: true
+          tags: runner-image:check
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+      - name: Check Image contract :1
+        run: image/check-contract.sh runner-image:check "${{ matrix.platform }}"
+
+  publish:
+    needs: [resolve, check]
+    if: needs.resolve.outputs.build == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: image
+          platforms: linux/amd64,linux/arm64
+          build-args: RUNNER_VERSION=${{ needs.resolve.outputs.version }}
+          push: true
+          # Attested below with actions/attest; buildx's own attestation
+          # manifests would add unknown/unknown entries to the index.
+          provenance: false
+          sbom: false
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+          tags: |
+            ${{ env.IMAGE }}:1
+            ${{ env.IMAGE }}:1-${{ needs.resolve.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
