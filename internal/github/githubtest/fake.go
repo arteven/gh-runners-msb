@@ -22,6 +22,11 @@ type Registration struct {
 
 // Fake records registrations and deletions and refuses to delete busy Runners.
 type Fake struct {
+	// Zero value is the happy path: an admin of a private repository.
+	NotAdmin    bool
+	Public      bool
+	RepoInfoErr error
+
 	mu      sync.Mutex
 	nextID  int64
 	regs    []Registration
@@ -50,6 +55,13 @@ func (f *Fake) DeleteRunner(_ context.Context, id int64) error {
 	}
 	f.deleted = append(f.deleted, id) // unknown IDs act like a 404: success
 	return nil
+}
+
+func (f *Fake) RepoInfo(context.Context) (github.RepoInfo, error) {
+	if f.RepoInfoErr != nil {
+		return github.RepoInfo{}, f.RepoInfoErr
+	}
+	return github.RepoInfo{Admin: !f.NotAdmin, Public: f.Public}, nil
 }
 
 // SetBusy makes DeleteRunner return ErrBusy for id while busy is true.
