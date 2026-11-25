@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 
@@ -119,5 +120,57 @@ func TestTokenReResolvedBeforeEveryCall(t *testing.T) {
 	got := reqs()
 	if len(got) != 2 || got[0].auth != "token t1" || got[1].auth != "token t2" {
 		t.Errorf("auth headers = %q, %q", got[0].auth, got[1].auth)
+	}
+}
+
+func TestRepoInfoRequestAndMapping(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want RepoInfo
+	}{
+		"private admin":          {`{"private":true,"permissions":{"admin":true}}`, RepoInfo{Admin: true, Public: false}},
+		"public non-admin":       {`{"private":false,"permissions":{"admin":false}}`, RepoInfo{Admin: false, Public: true}},
+		"public admin":           {`{"private":false,"permissions":{"admin":true}}`, RepoInfo{Admin: true, Public: true}},
+		"internal is not public": {`{"private":true,"visibility":"internal","permissions":{"admin":true}}`, RepoInfo{Admin: true}},
+		"empty fails closed":     {`{}`, RepoInfo{Admin: false, Public: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, reqs := setup(t, 200, tc.body, "t")
+			got, err := a.RepoInfo(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+			r := reqs()
+			if len(r) != 1 || r[0].method != "GET" || r[0].path != "/repos/o/r" {
+				t.Errorf("requests = %+v", r)
+			}
+		})
+	}
+}
+
+func TestRepoInfoNotFound(t *testing.T) {
+	a, _ := setup(t, 404, `{"message":"Not Found"}`, "t")
+	_, err := a.RepoInfo(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "o/r not found") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestNoTokenFailsWithoutRequest(t *testing.T) {
+	a, reqs := setup(t, 200, "{}", "")
+	if _, err := a.RepoInfo(t.Context()); !errors.Is(err, ErrNoToken) {
+		t.Errorf("RepoInfo err = %v, want ErrNoToken", err)
+	}
+	if _, err := a.GenerateJITConfig(t.Context(), "n", nil); !errors.Is(err, ErrNoToken) {
+		t.Errorf("GenerateJITConfig err = %v, want ErrNoToken", err)
+	}
+	if err := a.DeleteRunner(t.Context(), 1); !errors.Is(err, ErrNoToken) {
+		t.Errorf("DeleteRunner err = %v, want ErrNoToken", err)
+	}
+	if n := len(reqs()); n != 0 {
+		t.Errorf("%d requests sent without a token", n)
 	}
 }

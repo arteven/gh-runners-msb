@@ -19,6 +19,15 @@ import (
 // Runner is running a job.
 var ErrBusy = errors.New("runner is busy")
 
+// ErrNoToken is returned when gh holds no token for the repository's host.
+var ErrNoToken = errors.New("no GitHub token")
+
+// RepoInfo is what the preflight needs to know about the repository.
+type RepoInfo struct {
+	Admin  bool // the token's user is an admin of the repository
+	Public bool // anyone can see the repository (internal repos are not public)
+}
+
 // JITConfig is a just-in-time Runner registration.
 type JITConfig struct {
 	Encoded  string
@@ -32,6 +41,9 @@ type Port interface {
 	// DeleteRunner deregisters a Runner. It returns nil on 2xx and 404, and an
 	// error satisfying errors.Is(err, ErrBusy) on 422.
 	DeleteRunner(ctx context.Context, id int64) error
+	// RepoInfo reports whether the token's user is an admin and whether the
+	// repository is public. Missing fields fail closed: not admin, public.
+	RepoInfo(ctx context.Context) (RepoInfo, error)
 }
 
 const (
@@ -64,9 +76,13 @@ func newAdapter(repo repository.Repository, tokenFor func(string) string, rt htt
 // (gh may refresh it). Log options are left unset so go-gh's own GH_DEBUG
 // handling traces the calls.
 func (a *adapter) client() (*api.RESTClient, error) {
+	tok := a.tokenFor(a.repo.Host)
+	if tok == "" {
+		return nil, fmt.Errorf("%w for %s", ErrNoToken, a.repo.Host)
+	}
 	return api.NewRESTClient(api.ClientOptions{
 		Host:      a.repo.Host,
-		AuthToken: a.tokenFor(a.repo.Host),
+		AuthToken: tok,
 		Transport: a.transport,
 	})
 }
@@ -127,4 +143,32 @@ func (a *adapter) DeleteRunner(ctx context.Context, id int64) error {
 		return fmt.Errorf("delete runner %d: %w", id, err)
 	}
 	return nil
+}
+
+func (a *adapter) RepoInfo(ctx context.Context) (RepoInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+	c, err := a.client()
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	// Pointers tell a missing field from false, so a missing one fails closed.
+	var resp struct {
+		Private     *bool `json:"private"`
+		Permissions *struct {
+			Admin bool `json:"admin"`
+		} `json:"permissions"`
+	}
+	err = c.DoWithContext(ctx, http.MethodGet, fmt.Sprintf("repos/%s/%s", a.repo.Owner, a.repo.Name), nil, &resp)
+	var he *api.HTTPError
+	if errors.As(err, &he) && he.StatusCode == http.StatusNotFound {
+		return RepoInfo{}, fmt.Errorf("repository %s/%s not found, or your token can't see it", a.repo.Owner, a.repo.Name)
+	}
+	if err != nil {
+		return RepoInfo{}, fmt.Errorf("get repository: %w", err)
+	}
+	return RepoInfo{
+		Admin:  resp.Permissions != nil && resp.Permissions.Admin,
+		Public: resp.Private == nil || !*resp.Private,
+	}, nil
 }
