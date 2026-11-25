@@ -7,6 +7,12 @@
 //	docker build --build-arg BASE=grm-base -t grm-it internal/pool/testdata/fake-runner
 //	docker save -o /tmp/it.tar grm-it
 //	INTEGRATION_IMAGE_TAR=/tmp/it.tar go test -tags integration -timeout 20m ./internal/pool/
+//
+// TestSelfTestFailureStopsThePool also needs a non-conforming image (no dockerd):
+//
+//	docker build --build-arg BASE=grm-base -t grm-bad internal/pool/testdata/broken-runner
+//	docker save -o /tmp/bad.tar grm-bad
+//	INTEGRATION_BAD_IMAGE_TAR=/tmp/bad.tar ... (as above)
 package pool_test
 
 import (
@@ -28,7 +34,13 @@ import (
 )
 
 // A localhost/ tag keeps msb from ever looking up registry credentials.
-const testImage = "localhost/gh-runners-msb-test:ci"
+const (
+	testImage    = "localhost/gh-runners-msb-test:ci"
+	testBadImage = "localhost/gh-runners-msb-test:bad"
+)
+
+// badImageLoaded is set when INTEGRATION_BAD_IMAGE_TAR was loaded as testBadImage.
+var badImageLoaded bool
 
 // msbConfigPath is the msb config the tests resolve their Backend from. It has
 // no active_profile, so the Backend is local until a test flips it.
@@ -69,6 +81,13 @@ func testMain(m *testing.M) int {
 	if _, err := microsandbox.Image.Load(ctx, tar, testImage); err != nil {
 		os.Stderr.WriteString("Image.Load: " + err.Error() + "\n")
 		return 1
+	}
+	if bad := os.Getenv("INTEGRATION_BAD_IMAGE_TAR"); bad != "" {
+		if _, err := microsandbox.Image.Load(ctx, bad, testBadImage); err != nil {
+			os.Stderr.WriteString("Image.Load (bad): " + err.Error() + "\n")
+			return 1
+		}
+		badImageLoaded = true
 	}
 	return m.Run()
 }
@@ -127,6 +146,17 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 	// 1. A Runner registers.
 	eventually(t, "first registration", 3*time.Minute, func() bool { return len(gh.Registrations()) >= 1 })
 	reg1 := gh.Registrations()[0]
+	// The Self-test ran first, unregistered, and passed: Docker works, GitHub is
+	// reachable and the metadata endpoint is blocked, so the policy is enforced.
+	if o := out.String(); !strings.Contains(o, "self-test passed") ||
+		strings.Index(o, "self-test passed") > strings.Index(o, "Maintaining") {
+		t.Errorf("console lacks self-test passed before the banner:\n%s", o)
+	}
+	for _, r := range gh.Registrations() {
+		if strings.HasPrefix(strings.TrimPrefix(r.Name, id.Prefix()), "0-") {
+			t.Errorf("the Self-test registered %q", r.Name)
+		}
+	}
 	if got := strings.Join(reg1.Labels, ","); got != "self-hosted,msb-docker" {
 		t.Errorf("labels = %s", got)
 	}
@@ -223,6 +253,53 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 		}
 	case <-time.After(3 * time.Minute):
 		t.Fatal("Run did not return after cancel")
+	}
+	page, err := sandboxes.List(context.Background(), microsandbox.WithListLabels(map[string]string{identity.LabelKey: id.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Sandboxes) != 0 {
+		t.Errorf("%d sandboxes left behind", len(page.Sandboxes))
+	}
+}
+
+// An image that cannot start Docker fails the Self-test: the Pool returns an
+// error, prints a readable log tail, registers nothing and leaves no sandbox.
+func TestSelfTestFailureStopsThePool(t *testing.T) {
+	if !badImageLoaded {
+		t.Skip("INTEGRATION_BAD_IMAGE_TAR unset")
+	}
+	backend, err := msbprofile.Resolve(msbprofile.Input{Env: os.LookupEnv, ManagedPath: filepath.Join(t.TempDir(), "none.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxes := lc.Sandboxes()
+	gh := &githubtest.Fake{}
+	id := identity.NewPool("integration-install", "github.com/o/bad", "msb-docker")
+
+	var out, errOut syncBuf
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	err = pool.Run(ctx, pool.Config{
+		Slots: 1, Label: "msb-docker", Repo: "o/bad", Identity: id, Image: testBadImage,
+		GitHub: gh, Backend: backend, Sandboxes: sandboxes, Out: &out, Err: &errOut,
+		RetryDelay: time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "self-test failed") {
+		t.Fatalf("Run = %v, want a self-test failure", err)
+	}
+	if !strings.Contains(errOut.String(), "self-test: FAIL docker ready") {
+		t.Errorf("stderr lacks the log tail:\n%s", errOut.String())
+	}
+	if strings.Contains(out.String(), "Maintaining") {
+		t.Errorf("banner printed despite the failed self-test:\n%s", out.String())
+	}
+	if n := len(gh.Registrations()); n != 0 {
+		t.Errorf("%d registrations, want none", n)
 	}
 	page, err := sandboxes.List(context.Background(), microsandbox.WithListLabels(map[string]string{identity.LabelKey: id.ID}))
 	if err != nil {

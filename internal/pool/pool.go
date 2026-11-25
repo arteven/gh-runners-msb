@@ -45,6 +45,9 @@ type Config struct {
 const (
 	destroyTimeout = 60 * time.Second
 	tailLines      = 40
+	// selfTestTimeout bounds the guest script: 90 s for Docker plus the curls,
+	// with slack. A hung guest is a failed Self-test, not a hung Pool.
+	selfTestTimeout = 3 * time.Minute
 )
 
 // Run fills all Slots together and refills each as its Runner exits. It
@@ -72,6 +75,16 @@ func Run(parent context.Context, cfg Config) error {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 	p := &runner{cfg: cfg, con: con, spec: spec.Local(cfg.Sizes, cfg.Image, cfg.Identity.ID), cancel: cancel}
+	// Prove a Runner can start before filling any Slot. A Ctrl-C during it is a
+	// clean stop, with no banner.
+	if ctx.Err() == nil {
+		if err := p.selfTest(ctx); err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
 	con.info("pool", "Maintaining %d slots for %s; label %s", cfg.Slots, cfg.Repo, cfg.Label)
 	con.info("pool", "backend: %s", cfg.Backend)
 
@@ -169,6 +182,46 @@ func (p *runner) iterate(ctx context.Context, n int, who string) error {
 		return fmt.Errorf("runner exited with status %d", code)
 	}
 	return nil
+}
+
+// selfTest runs the Self-test in one unregistered sandbox built exactly like a
+// Runner (same image, sizes and network policy). It returns nil when ctx ended
+// first (Ctrl-C), and otherwise an error unless every check passed.
+func (p *runner) selfTest(ctx context.Context) error {
+	const who = "pool"
+	// Slots count from 1, so slot 0 is never a Runner. The name carries the Pool
+	// prefix, so startup Cleanup removes it if the Pool crashed mid-Self-test.
+	name := p.cfg.Identity.RunnerName(0)
+	p.con.info(who, "self-test: starting")
+
+	// Never cancel a create: superradcompany/microsandbox#1687.
+	sb, err := p.cfg.Sandboxes.Create(context.WithoutCancel(ctx), name, p.spec.Options()...)
+	if err != nil {
+		if microsandbox.IsKind(err, microsandbox.ErrRuntimeNotInstalled) {
+			return fmt.Errorf("msb is not installed; install it with: %s", MsbInstallCmd)
+		}
+		return fmt.Errorf("self-test failed: create %s: %w", name, err)
+	}
+	defer p.destroy(who, sb)
+
+	logs := &tail{n: tailLines}
+	runCtx, cancel := context.WithTimeout(ctx, selfTestTimeout)
+	defer cancel()
+	code, err := guest.SelfTest(runCtx, sb, logs)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err == nil && code == 0 {
+		p.con.info(who, "self-test passed")
+		return nil
+	}
+	for _, l := range logs.Lines() {
+		p.con.warn(who, "  | %s", l)
+	}
+	if err != nil {
+		return fmt.Errorf("self-test failed: %w", err)
+	}
+	return fmt.Errorf("self-test failed: script exited with status %d", code)
 }
 
 func (p *runner) destroy(who string, sb *microsandbox.Sandbox) {

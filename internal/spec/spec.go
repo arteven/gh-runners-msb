@@ -82,9 +82,37 @@ func (s Spec) Options() []microsandbox.SandboxOption {
 	return opts
 }
 
-// publicEgress lets a Runner reach GitHub and registries on the public
-// internet. msb's default is egress deny, which would leave a Runner unable to
-// register. The full deny list is a later ticket (#33); keep this one function.
+// publicEgress confines a Runner to the public internet: it can reach GitHub
+// and registries, but not the host, other Runners, the LAN, loopback or the
+// cloud metadata endpoint.
+//
+// Rules are first match wins, so the order is the policy:
+//  1. DNS to the host's gateway resolver. It must precede the host deny, or the
+//     in-VM DNS proxy could not resolve anything.
+//  2. Deny the reserved groups. "private" also covers CGNAT, fc00::/7 and the
+//     host's on-link prefixes, which is what keeps Runners apart.
+//  3. Allow "public", the complement of the reserved ranges.
+//
+// Only groups and CIDRs, never DenyDomains: domain rules would need TLS
+// interception, which is out of scope. DefaultIngress stays allow, as in the
+// SDK's profiles; no ports are published.
 func publicEgress() microsandbox.SandboxOption {
-	return microsandbox.WithNetwork(microsandbox.NetworkPolicy.FromProfiles(microsandbox.NetworkProfilePublic))
+	rules := []microsandbox.PolicyRule{microsandbox.Rule.AllowDNS()}
+	for _, group := range []string{"loopback", "private", "link-local", "metadata", "host", "multicast"} {
+		rules = append(rules, microsandbox.PolicyRule{
+			Action:      microsandbox.PolicyActionDeny,
+			Direction:   microsandbox.PolicyDirectionEgress,
+			Destination: group,
+		})
+	}
+	rules = append(rules, microsandbox.PolicyRule{
+		Action:      microsandbox.PolicyActionAllow,
+		Direction:   microsandbox.PolicyDirectionEgress,
+		Destination: "public",
+	})
+	return microsandbox.WithNetwork(&microsandbox.NetworkConfig{
+		Rules:          rules,
+		DefaultEgress:  microsandbox.PolicyActionDeny,
+		DefaultIngress: microsandbox.PolicyActionAllow,
+	})
 }

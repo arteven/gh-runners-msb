@@ -87,7 +87,14 @@ jobs:
           docker build --build-arg BASE=runner-base:it -t runner-it:ci internal/pool/testdata/fake-runner
           docker save -o "$RUNNER_TEMP/it.tar" runner-it:ci
 
+      # Non-conforming: no dockerd, so the Self-test must fail.
+      - name: Build and save the broken image
+        run: |
+          docker build --build-arg BASE=runner-base:it -t runner-bad:ci internal/pool/testdata/broken-runner
+          docker save -o "$RUNNER_TEMP/bad.tar" runner-bad:ci
+
       - name: Integration test
         env:
           INTEGRATION_IMAGE_TAR: ${{ runner.temp }}/it.tar
+          INTEGRATION_BAD_IMAGE_TAR: ${{ runner.temp }}/bad.tar
         run: go test -tags integration -timeout 20m -v ./internal/pool/
