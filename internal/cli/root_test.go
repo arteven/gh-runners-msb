@@ -66,3 +66,29 @@ func TestUpRejectsBadFlagsBeforeAnyIO(t *testing.T) {
 		t.Errorf("up touched the filesystem before validating flags: %v", entries)
 	}
 }
+
+func TestUpWithoutLocalMsbStopsBeforeCreatingAnything(t *testing.T) {
+	// An empty home holds no msb runtime; an empty MSB_HOME also hides any
+	// profile the developer has saved.
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("HOME", home)
+	t.Setenv("MSB_HOME", home)
+	t.Setenv("MSB_CONFIG_PATH", "")
+	for _, k := range []string{"MSB_BACKEND", "MSB_PROFILE", "MSB_API_KEY", "MSB_API_URL", "MSB_PATH", "MSB_LIBKRUNFW_PATH"} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+
+	var out bytes.Buffer
+	cmd := NewRootCmd("dev")
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"up", "-R", "o/r"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "curl -fsSL https://install.microsandbox.dev | sh") {
+		t.Fatalf("want an error carrying the msb install command, got %v", err)
+	}
+	if strings.Contains(out.String(), "Maintaining") {
+		t.Errorf("the Pool started despite a missing msb:\n%s", out.String())
+	}
+}

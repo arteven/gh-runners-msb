@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -22,31 +23,54 @@ import (
 
 	"github.com/arteven/gh-runners-msb/internal/github/githubtest"
 	"github.com/arteven/gh-runners-msb/internal/identity"
+	"github.com/arteven/gh-runners-msb/internal/msbprofile"
 	"github.com/arteven/gh-runners-msb/internal/pool"
 )
 
 // A localhost/ tag keeps msb from ever looking up registry credentials.
 const testImage = "localhost/gh-runners-msb-test:ci"
 
-func TestMain(m *testing.M) {
+// msbConfigPath is the msb config the tests resolve their Backend from. It has
+// no active_profile, so the Backend is local until a test flips it.
+var msbConfigPath string
+
+func TestMain(m *testing.M) { os.Exit(testMain(m)) }
+
+func testMain(m *testing.M) int {
 	tar := os.Getenv("INTEGRATION_IMAGE_TAR")
 	if tar == "" {
 		os.Stderr.WriteString("INTEGRATION_IMAGE_TAR unset; skipping integration tests\n")
-		os.Exit(0)
+		return 0
 	}
-	// Image.Load uses the default context; make it the local one.
-	os.Setenv("MSB_BACKEND", "local")
+	// Not MSB_BACKEND=local: that would beat any saved profile and make the
+	// profile-flip test prove nothing. Image.Load uses the default context, which
+	// resolves to local through this config.
+	dir, err := os.MkdirTemp("", "msb-config-")
+	if err != nil {
+		os.Stderr.WriteString("MkdirTemp: " + err.Error() + "\n")
+		return 1
+	}
+	defer os.RemoveAll(dir)
+	msbConfigPath = filepath.Join(dir, "config.json")
+	if err := os.WriteFile(msbConfigPath, []byte(`{"version":1}`), 0o644); err != nil {
+		os.Stderr.WriteString("write config: " + err.Error() + "\n")
+		return 1
+	}
+	os.Setenv("MSB_CONFIG_PATH", msbConfigPath)
+	for _, k := range []string{"MSB_BACKEND", "MSB_PROFILE", "MSB_API_KEY", "MSB_API_URL"} {
+		os.Unsetenv(k)
+	}
 	ctx := context.Background()
 	// Test-only: the Pool itself never installs msb.
 	if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
 		os.Stderr.WriteString("EnsureRuntime: " + err.Error() + "\n")
-		os.Exit(1)
+		return 1
 	}
 	if _, err := microsandbox.Image.Load(ctx, tar, testImage); err != nil {
 		os.Stderr.WriteString("Image.Load: " + err.Error() + "\n")
-		os.Exit(1)
+		return 1
 	}
-	os.Exit(m.Run())
+	return m.Run()
 }
 
 func eventually(t *testing.T, what string, timeout time.Duration, ok func() bool) {
@@ -65,6 +89,14 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 	const tokenSentinel = "gh-token-sentinel"
 	t.Setenv("GH_TOKEN", tokenSentinel)
 
+	// Resolve and pin exactly as `up` does.
+	backend, err := msbprofile.Resolve(msbprofile.Input{Env: os.LookupEnv, ManagedPath: filepath.Join(t.TempDir(), "none.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.Kind != msbprofile.Local {
+		t.Fatalf("backend = %v, want local", backend)
+	}
 	lc, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +112,7 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 	go func() {
 		done <- pool.Run(ctx, pool.Config{
 			Slots: 1, Label: "msb-docker", Repo: "o/r", Identity: id, Image: testImage,
-			GitHub: gh, Sandboxes: sandboxes, Out: &out, Err: &errOut,
+			GitHub: gh, Backend: backend, Sandboxes: sandboxes, Out: &out, Err: &errOut,
 			RetryDelay: time.Second,
 		})
 	}()
@@ -144,7 +176,17 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 		}
 	}
 
-	// 4. Take the "job": the Runner exits, is destroyed, deregistered, replaced.
+	// 4. Flip the saved profile to a dead remote Backend mid-run, then take the
+	// "job": the Runner exits, is destroyed, deregistered, replaced. The refill
+	// registers and is found on the pinned local context only if every SDK call
+	// goes through that context; an unpinned call would chase the dead URL.
+	flipped := `{"version":1,"active_profile":"dead","profiles":{"dead":{"kind":"remote","url":"http://127.0.0.1:1","api_key_ref":"inline:x"}}}`
+	if err := os.WriteFile(msbConfigPath, []byte(flipped), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if flippedTo, err := msbprofile.Resolve(msbprofile.Input{Env: os.LookupEnv, ManagedPath: filepath.Join(t.TempDir(), "none.json")}); err != nil || flippedTo.Kind != msbprofile.Remote {
+		t.Fatalf("flip did not take effect: %v, %v", flippedTo, err)
+	}
 	sh("touch /tmp/fake-runner/take-job")
 	eventually(t, "VM destroyed, runner deregistered and slot refilled", 3*time.Minute, func() bool {
 		_, err := sandboxes.Get(ctx, reg1.Name)
@@ -158,8 +200,14 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 		return deleted && len(gh.Registrations()) >= 2
 	})
 	reg2 := gh.Registrations()[1]
+	if _, err := sandboxes.Get(ctx, reg2.Name); err != nil {
+		t.Errorf("refill %s is not on the pinned context after the profile flip: %v", reg2.Name, err)
+	}
 	if reg2.Name == reg1.Name || !id.Owns(reg2.Name) {
 		t.Errorf("replacement name %q (first %q)", reg2.Name, reg1.Name)
+	}
+	if !strings.Contains(out.String(), "backend: local (default)") {
+		t.Errorf("banner lacks the backend line:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "runner finished; replacing VM") {
 		t.Errorf("console lacks the finished line:\n%s", out.String())

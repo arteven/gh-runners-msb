@@ -11,7 +11,6 @@ import (
 
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/spf13/cobra"
-	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
 
 	"github.com/arteven/gh-runners-msb/internal/github"
 	"github.com/arteven/gh-runners-msb/internal/identity"
@@ -112,9 +111,13 @@ func runUp(cmd *cobra.Command, o upOptions) error {
 	}
 	id := identity.NewPool(installID, repo.Host+"/"+repo.Owner+"/"+repo.Name, o.label)
 
-	lc, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
+	backend, err := resolveBackend()
 	if err != nil {
-		return fmt.Errorf("opening msb: %w", err)
+		return err
+	}
+	sandboxes, err := pinBackend(backend)
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -127,7 +130,8 @@ func runUp(cmd *cobra.Command, o upOptions) error {
 		Repo:      displayRepo(repo),
 		Identity:  id,
 		GitHub:    github.New(repo),
-		Sandboxes: lc.Sandboxes(),
+		Backend:   backend,
+		Sandboxes: sandboxes,
 		Out:       cmd.OutOrStdout(),
 		Err:       cmd.ErrOrStderr(),
 	})
