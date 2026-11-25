@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -29,13 +30,35 @@ func TestVersionFlagReportsExtensionSDKAndImageContract(t *testing.T) {
 	}
 }
 
-func TestStubVerbsAreNotImplemented(t *testing.T) {
-	for _, verb := range []string{"up", "cleanup"} {
+func TestCleanupIsStillAStub(t *testing.T) {
+	cmd := NewRootCmd("dev")
+	cmd.SetArgs([]string{"cleanup"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
+		t.Errorf("cleanup: want not-implemented error, got %v", err)
+	}
+}
+
+func TestUpRejectsBadFlagsBeforeAnyIO(t *testing.T) {
+	// Point every place up could touch at an empty dir, then check nothing appears.
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("HOME", home)
+	t.Setenv("MSB_HOME", home)
+
+	for _, args := range [][]string{
+		{"up", "-R", "o/r", "--slots", "0"},
+		{"up", "-R", "o/r", "--slots", "-3"},
+		{"up", "-R", "o/r", "--label", " "},
+	} {
 		cmd := NewRootCmd("dev")
-		cmd.SetArgs([]string{verb})
-		err := cmd.Execute()
-		if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
-			t.Errorf("%s: want not-implemented error, got %v", verb, err)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("%v: want error", args)
 		}
+	}
+	entries, _ := os.ReadDir(home)
+	if len(entries) != 0 {
+		t.Errorf("up touched the filesystem before validating flags: %v", entries)
 	}
 }
