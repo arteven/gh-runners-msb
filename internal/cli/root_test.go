@@ -50,6 +50,10 @@ func TestUpRejectsBadFlagsBeforeAnyIO(t *testing.T) {
 		{"up", "-R", "o/r", "--slots", "0"},
 		{"up", "-R", "o/r", "--slots", "-3"},
 		{"up", "-R", "o/r", "--label", " "},
+		{"up", "-R", "o/r", "--cpus", "0"},
+		{"up", "-R", "o/r", "--memory", "4X"},
+		{"up", "-R", "o/r", "--disk", "0G"},
+		{"up", "-R", "o/r", "--disk", "2G", "--docker-disk", "2G"},
 	} {
 		cmd := NewRootCmd("dev")
 		cmd.SetArgs(args)

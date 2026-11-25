@@ -12,8 +12,8 @@ import (
 // DefaultImage is the published Runner image (Image contract 1).
 const DefaultImage = "ghcr.io/arteven/gh-runners-msb:1"
 
-// Sizes are the per-Runner resources. Defaults is the one place they live
-// until flags replace them.
+// Sizes are the per-Runner resources, set by the up sizing flags. Defaults is
+// what pool.Run falls back to when Sizes is zero.
 type Sizes struct {
 	CPUs      uint8
 	MemoryMiB uint32
@@ -39,6 +39,7 @@ type Spec struct {
 
 // Local is the spec for a Runner on the local Backend: root is the disk minus
 // the docker disk, which is a separate owned ext4 volume at /var/lib/docker.
+// The subtraction is only safe because the CLI guarantees DockerMiB < DiskMiB.
 func Local(s Sizes, image, poolID string) Spec {
 	return Spec{
 		Image:       image,
