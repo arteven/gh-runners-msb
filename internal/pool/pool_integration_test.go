@@ -104,6 +104,40 @@ func eventually(t *testing.T, what string, timeout time.Duration, ok func() bool
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// assertRunnerLogs checks that a finished Runner left its evidence behind, in
+// private directories and files, in a log root the Pool created.
+func assertRunnerLogs(t *testing.T, logRoot, runner string) {
+	t.Helper()
+	perm := func(p string) os.FileMode {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("missing %s: %v", p, err)
+			return 0
+		}
+		return fi.Mode().Perm()
+	}
+	dir := filepath.Join(logRoot, runner)
+	for _, d := range []string{logRoot, dir, filepath.Join(dir, "_diag")} {
+		if m := perm(d); m != 0o700 {
+			t.Errorf("%s mode = %o, want 700", d, m)
+		}
+	}
+	for _, f := range []string{"host.log", "dockerd.log", filepath.Join("_diag", "Runner_fake.log")} {
+		if m := perm(filepath.Join(dir, f)); m != 0o600 {
+			t.Errorf("%s mode = %o, want 600", f, m)
+		}
+	}
+	host, _ := os.ReadFile(filepath.Join(dir, "host.log"))
+	for _, want := range []string{"runner " + runner + " started", "Docker ready; starting GitHub listener"} {
+		if !strings.Contains(string(host), want) {
+			t.Errorf("host.log lacks %q:\n%s", want, host)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "dockerd.log")); len(b) == 0 {
+		t.Error("dockerd.log is empty")
+	}
+}
+
 func TestOneSlotFullLifecycle(t *testing.T) {
 	const tokenSentinel = "gh-token-sentinel"
 	t.Setenv("GH_TOKEN", tokenSentinel)
@@ -127,10 +161,13 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out, errOut syncBuf
+	// Missing on purpose: Run must create it 0700.
+	logRoot := filepath.Join(t.TempDir(), "logs")
 	done := make(chan error, 1)
 	go func() {
 		done <- pool.Run(ctx, pool.Config{
-			Slots: 1, Label: "msb-docker", Repo: "o/r", Identity: id, Image: testImage,
+			LogDir: logRoot,
+			Slots:  1, Label: "msb-docker", Repo: "o/r", Identity: id, Image: testImage,
 			GitHub: gh, Backend: backend, Sandboxes: sandboxes, Out: &out, Err: &errOut,
 			RetryDelay: time.Second,
 		})
@@ -229,6 +266,7 @@ func TestOneSlotFullLifecycle(t *testing.T) {
 		}
 		return deleted && len(gh.Registrations()) >= 2
 	})
+	assertRunnerLogs(t, logRoot, reg1.Name)
 	reg2 := gh.Registrations()[1]
 	if _, err := sandboxes.Get(ctx, reg2.Name); err != nil {
 		t.Errorf("refill %s is not on the pinned context after the profile flip: %v", reg2.Name, err)
@@ -284,8 +322,10 @@ func TestSelfTestFailureStopsThePool(t *testing.T) {
 	var out, errOut syncBuf
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	logRoot := filepath.Join(t.TempDir(), "logs")
 	err = pool.Run(ctx, pool.Config{
-		Slots: 1, Label: "msb-docker", Repo: "o/bad", Identity: id, Image: testBadImage,
+		LogDir: logRoot,
+		Slots:  1, Label: "msb-docker", Repo: "o/bad", Identity: id, Image: testBadImage,
 		GitHub: gh, Backend: backend, Sandboxes: sandboxes, Out: &out, Err: &errOut,
 		RetryDelay: time.Second,
 	})
@@ -294,6 +334,14 @@ func TestSelfTestFailureStopsThePool(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "self-test: FAIL docker ready") {
 		t.Errorf("stderr lacks the log tail:\n%s", errOut.String())
+	}
+	// The failure is recorded in the Self-test sandbox's host.log too.
+	hosts, _ := filepath.Glob(filepath.Join(logRoot, "*", "host.log"))
+	if len(hosts) != 1 {
+		t.Fatalf("host.log files = %v, want exactly one", hosts)
+	}
+	if host, _ := os.ReadFile(hosts[0]); !strings.Contains(string(host), "self-test failed") {
+		t.Errorf("host.log lacks the self-test failure:\n%s", host)
 	}
 	if strings.Contains(out.String(), "Maintaining") {
 		t.Errorf("banner printed despite the failed self-test:\n%s", out.String())
