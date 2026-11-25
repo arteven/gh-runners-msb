@@ -284,7 +284,9 @@ func (p *runner) iterate(ctx context.Context, n int, who string) error {
 		}
 		// An error, so the slot waits RetryDelay: a Runner that dies at once
 		// must not turn the Slot into a hot create loop.
-		return fmt.Errorf("runner exited with status %d (logs: %s)", code, rd.Dir)
+		err := fmt.Errorf("runner exited with status %d (logs: %s)", code, rd.Dir)
+		l.warnFileOnly("%v", err)
+		return err
 	}
 	return nil
 }
@@ -336,9 +338,12 @@ func (p *runner) selfTest(ctx context.Context) error {
 		p.con.warn(who, "  | %s", line)
 	}
 	if err != nil {
-		return fmt.Errorf("self-test failed (logs: %s): %w", rd.Dir, err)
+		err = fmt.Errorf("self-test failed (logs: %s): %w", rd.Dir, err)
+	} else {
+		err = fmt.Errorf("self-test failed: script exited with status %d (logs: %s)", code, rd.Dir)
 	}
-	return fmt.Errorf("self-test failed: script exited with status %d (logs: %s)", code, rd.Dir)
+	l.warnFileOnly("%v", err)
+	return err
 }
 
 func (p *runner) destroy(l *runnerLog, sb *microsandbox.Sandbox) {

@@ -322,8 +322,9 @@ func TestSelfTestFailureStopsThePool(t *testing.T) {
 	var out, errOut syncBuf
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	logRoot := filepath.Join(t.TempDir(), "logs")
 	err = pool.Run(ctx, pool.Config{
-		LogDir: filepath.Join(t.TempDir(), "logs"),
+		LogDir: logRoot,
 		Slots:  1, Label: "msb-docker", Repo: "o/bad", Identity: id, Image: testBadImage,
 		GitHub: gh, Backend: backend, Sandboxes: sandboxes, Out: &out, Err: &errOut,
 		RetryDelay: time.Second,
@@ -333,6 +334,14 @@ func TestSelfTestFailureStopsThePool(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "self-test: FAIL docker ready") {
 		t.Errorf("stderr lacks the log tail:\n%s", errOut.String())
+	}
+	// The failure is recorded in the Self-test sandbox's host.log too.
+	hosts, _ := filepath.Glob(filepath.Join(logRoot, "*", "host.log"))
+	if len(hosts) != 1 {
+		t.Fatalf("host.log files = %v, want exactly one", hosts)
+	}
+	if host, _ := os.ReadFile(hosts[0]); !strings.Contains(string(host), "self-test failed") {
+		t.Errorf("host.log lacks the self-test failure:\n%s", host)
 	}
 	if strings.Contains(out.String(), "Maintaining") {
 		t.Errorf("banner printed despite the failed self-test:\n%s", out.String())
