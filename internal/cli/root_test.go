@@ -54,6 +54,7 @@ func TestUpRejectsBadFlagsBeforeAnyIO(t *testing.T) {
 		{"up", "-R", "o/r", "--memory", "4X"},
 		{"up", "-R", "o/r", "--disk", "0G"},
 		{"up", "-R", "o/r", "--disk", "2G", "--docker-disk", "2G"},
+		{"up", "-R", "ghe.example.com/o/r"},
 	} {
 		cmd := NewRootCmd("dev")
 		cmd.SetArgs(args)
@@ -90,5 +91,17 @@ func TestUpWithoutLocalMsbStopsBeforeCreatingAnything(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "Maintaining") {
 		t.Errorf("the Pool started despite a missing msb:\n%s", out.String())
+	}
+}
+
+func TestUpRefusesNonGitHubHost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("HOME", home)
+	cmd := NewRootCmd("dev")
+	cmd.SetArgs([]string{"up", "-R", "ghe.example.com/o/r"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "github.com") {
+		t.Errorf("err = %v, want it to name github.com", err)
 	}
 }

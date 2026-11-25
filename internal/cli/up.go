@@ -27,6 +27,8 @@ func newUpCmd() *cobra.Command {
 		slots    int
 		label    string
 
+		allowPublic bool
+
 		cpus                     int
 		memory, disk, dockerDisk string
 	)
@@ -46,13 +48,14 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runUp(cmd, upOptions{repo: repoFlag, slots: slots, label: label, sizes: sizes})
+			return runUp(cmd, upOptions{repo: repoFlag, slots: slots, label: label, sizes: sizes, allowPublic: allowPublic})
 		},
 	}
 	f := cmd.Flags()
 	f.StringVarP(&repoFlag, "repo", "R", "", "repository as [HOST/]OWNER/REPO (default: current repository)")
 	f.IntVar(&slots, "slots", 5, "number of runners to keep ready")
 	f.StringVar(&label, "label", defaultLabel, "runner label that jobs target in runs-on")
+	f.BoolVar(&allowPublic, "allow-public-repo", false, "allow a public repository (fork PRs could run code on your machine)")
 	f.IntVar(&cpus, "cpus", int(spec.Defaults.CPUs), "virtual CPUs per runner")
 	f.StringVar(&memory, "memory", "4G", "memory per runner (e.g. 4G, 512MiB)")
 	f.StringVar(&disk, "disk", "5G", "writable disk budget per runner, including Docker's share")
@@ -93,11 +96,16 @@ type upOptions struct {
 	slots int
 	label string
 	sizes spec.Sizes
+
+	allowPublic bool
 }
 
 func runUp(cmd *cobra.Command, o upOptions) error {
 	repo, err := resolveRepo(o.repo)
 	if err != nil {
+		return err
+	}
+	if err := checkHost(repo); err != nil {
 		return err
 	}
 
@@ -123,13 +131,18 @@ func runUp(cmd *cobra.Command, o upOptions) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	gh := github.New(repo)
+	if err := checkGitHub(ctx, gh, displayRepo(repo), o.allowPublic); err != nil {
+		return err
+	}
+
 	return pool.Run(ctx, pool.Config{
 		Slots:     o.slots,
 		Label:     o.label,
 		Sizes:     o.sizes,
 		Repo:      displayRepo(repo),
 		Identity:  id,
-		GitHub:    github.New(repo),
+		GitHub:    gh,
 		Backend:   backend,
 		Sandboxes: sandboxes,
 		Out:       cmd.OutOrStdout(),
@@ -154,9 +167,7 @@ func resolveRepo(flag string) (repository.Repository, error) {
 	return r, nil
 }
 
+// displayRepo is OWNER/REPO; checkHost has already limited repo to github.com.
 func displayRepo(r repository.Repository) string {
-	if r.Host == "" || strings.EqualFold(r.Host, "github.com") {
-		return r.Owner + "/" + r.Name
-	}
-	return r.Host + "/" + r.Owner + "/" + r.Name
+	return r.Owner + "/" + r.Name
 }

@@ -26,7 +26,7 @@ const MsbInstallCmd = "curl -fsSL https://install.microsandbox.dev | sh"
 type Config struct {
 	Slots    int
 	Label    string
-	Repo     string // shown in the banner: OWNER/REPO, or HOST/OWNER/REPO off github.com
+	Repo     string // shown in the banner: OWNER/REPO
 	Identity identity.Pool
 	Sizes    spec.Sizes
 	Image    string
