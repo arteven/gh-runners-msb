@@ -72,22 +72,15 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      # A PR that touches image/ is tested against the image it builds;
-      # everything else against the published :1.
+      # Always built from image/, never pulled: the published :1 may not exist
+      # yet (or be private), and the test must not depend on it.
       - name: Base Runner image
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = pull_request ] && [ -n "$(git diff --name-only "$BASE_SHA" HEAD -- image/)" ]; then
-            v=$(gh api repos/actions/runner/releases/latest --jq .tag_name)
-            docker build --build-arg "RUNNER_VERSION=${v#v}" -t runner-base:it image/
-          else
-            docker pull ghcr.io/arteven/gh-runners-msb:1
-            docker tag ghcr.io/arteven/gh-runners-msb:1 runner-base:it
-          fi
+          v=$(gh api repos/actions/runner/releases/latest --jq .tag_name)
+          docker build --build-arg "RUNNER_VERSION=${v#v}" -t runner-base:it image/
 
       - name: Build and save the stand-in runner image
         run: |
