@@ -1,0 +1,251 @@
+# Release: pushing a vX.Y.Z tag cuts a verified release in one action.
+#
+# HOW TO RELEASE
+#   Tag with an ANNOTATED tag and push it (never a branch push, never the UI):
+#     git tag -a v0.1.0 -m "Database schema: unchanged"
+#     git push origin v0.1.0
+#   Tags containing '-' (v0.1.0-rc.1) become prereleases.
+#
+#   The tag message states the msb database-schema change. It is REQUIRED when
+#   the msb SDK in go.mod differs from the previous release's, or when there
+#   is no previous release. Use "Database schema: unchanged" or
+#   "Database schema: migrated (needs msb >= X)"; it goes into the notes
+#   verbatim. Check https://github.com/superradcompany/microsandbox
+#   crates/db/ and docs/migrations/ between the two SDK tags. If the SDK is
+#   unchanged the notes say "unchanged" on their own (a tag message is
+#   appended if present). A missing message fails `prepare` before anything is
+#   built or published; fix with `git push --delete origin <tag>` and re-push.
+#
+#   Releases are immutable once published (repo setting): fix bad releases
+#   forward with a new tag. Verify with
+#     gh attestation verify <asset> -R arteven/gh-runners-msb
+#     sha256sum -c SHA256SUMS
+#     gh release verify <tag>
+#
+# On pull requests that touch this file the whole pipeline runs as a dry run
+# (version v0.0.0-dryrun): everything except attestation and publishing.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # No branch filter: PRs into stacked parent branches run too.
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.prep.outputs.version }}
+      prerelease: ${{ steps.prep.outputs.prerelease }}
+      notes: ${{ steps.prep.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: prep
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sdk_of() { awk '$1=="github.com/superradcompany/microsandbox/sdk/go"{print $2}'; }
+
+          if [ "$EVENT" = push ]; then
+            tag=$REF_NAME
+            if ! [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Tag '$tag' is not vX.Y.Z or vX.Y.Z-prerelease."
+              exit 1
+            fi
+            version=$tag
+          else
+            tag=v0.0.0-dryrun
+            version=$tag
+          fi
+          prerelease=
+          if [ "$EVENT" = push ] && [[ $version == *-* ]]; then prerelease=true; fi
+
+          sdk=$(sdk_of < go.mod)
+          if ! [[ $sdk =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::msb SDK in go.mod is '$sdk'; releases need an exact vX.Y.Z (no pseudo-versions)."
+            exit 1
+          fi
+
+          prev=$(gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName // empty')
+          prev_sdk=
+          if [ -n "$prev" ]; then
+            prev_sdk=$(gh api "repos/$GH_REPO/contents/go.mod?ref=$prev" -q .content | base64 -d | sdk_of)
+          fi
+
+          msg=
+          if [ "$EVENT" = push ]; then
+            ref=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q '.object.type+" "+.object.sha')
+            if [ "${ref%% *}" = tag ]; then
+              # Drop a signed tag's signature block.
+              msg=$(gh api "repos/$GH_REPO/git/tags/${ref##* }" -q .message | sed '/^-----BEGIN/,$d')
+            fi
+          fi
+
+          {
+            echo "**msb SDK:** $sdk (also the minimum supported msb version)"
+            echo
+            if [ -n "$prev" ] && [ "$prev_sdk" = "$sdk" ]; then
+              echo "**Database schema:** unchanged (same msb SDK as $prev)"
+              if [ -n "$msg" ]; then echo; echo "$msg"; fi
+            elif [ -n "$msg" ]; then
+              echo "$msg"
+            elif [ "$EVENT" = push ]; then
+              echo "::error::The msb SDK changed (${prev_sdk:-no previous release} -> $sdk) so the tag message must state the database-schema change." >&2
+              echo "::error::Compare https://github.com/superradcompany/microsandbox/compare/sdk/go/${prev_sdk:-<old>}...sdk/go/$sdk and look at crates/db/ and docs/migrations/." >&2
+              echo "::error::Then: git push --delete origin $tag, and re-push an annotated tag: git tag -a $tag -m 'Database schema: unchanged'" >&2
+              exit 1
+            else
+              echo "**Database schema:** (dry run: the real tag message goes here)"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+          cat "$RUNNER_TEMP/notes.md"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "notes<<NOTES_EOF_7f3a"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "NOTES_EOF_7f3a"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, goos: linux, goarch: amd64, asset: gh-runners-msb-linux-amd64 }
+          - { os: ubuntu-24.04-arm, goos: linux, goarch: arm64, asset: gh-runners-msb-linux-arm64 }
+          - { os: macos-15, goos: darwin, goarch: arm64, asset: gh-runners-msb-darwin-arm64 }
+    env:
+      # The msb SDK needs cgo; never build without it.
+      CGO_ENABLED: "1"
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+      - name: Build
+        env:
+          # Runner toolchains default above the supported floor; cgo links with clang.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: go build -trimpath -ldflags "-X main.version=$VERSION" -o "dist/$ASSET" .
+
+      - name: Floor check (glibc >= 2.34)
+        if: matrix.goos == 'linux'
+        run: |
+          max=$(objdump -T "dist/$ASSET" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "Highest glibc symbol version: $max"
+          if ! printf '%s\n' GLIBC_2.34 "$max" | sort -V -C; then
+            echo "::error::$ASSET needs $max, above the GLIBC_2.34 floor. Do not raise the floor here; report it on the parent spec (#23)."
+            exit 1
+          fi
+
+      - name: Floor check (macOS >= 14)
+        if: matrix.goos == 'darwin'
+        run: |
+          vtool -show-build "dist/$ASSET"
+          vtool -show-build "dist/$ASSET" | grep -Eq 'minos 14\.0$'
+
+      - name: Smoke --version (proves ldflags stamping and FFI load)
+        run: |
+          out=$("./dist/$ASSET" --version)
+          echo "$out"
+          grep -qF "$VERSION" <<<"$out"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+      # One attestation per binary, made by the job that built the bytes.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name == 'push'
+        with:
+          subject-path: dist/${{ matrix.asset }}
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums and notes
+        env:
+          NOTES: ${{ needs.prepare.outputs.notes }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          (cd dist && sha256sum gh-runners-msb-* > SHA256SUMS)
+          {
+            echo '## SHA256SUMS'
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo '## Release notes header'
+            cat "$RUNNER_TEMP/notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -l dist
+
+      - name: Publish
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # A draft left by an earlier failed run is mutable; never delete a published release.
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || true)" = true ]; then
+            gh release delete "$TAG" --yes
+          fi
+          args=()
+          if [ -n "$PRERELEASE" ]; then args+=(--prerelease); fi
+          # Assets go up while still a draft: immutable releases forbid adding them later.
+          gh release create "$TAG" dist/* --draft --verify-tag --generate-notes \
+            --notes-file "$RUNNER_TEMP/notes.md" --title "$TAG" "${args[@]}"
+          gh release edit "$TAG" --draft=false
