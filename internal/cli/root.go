@@ -36,7 +36,7 @@ func NewRootCmd(version string) *cobra.Command {
 	// loaded only when --version is asked for, not on every invocation.
 	root.Flags().BoolVar(&showVersion, "version", false, "print version information")
 
-	root.AddCommand(stubCmd("up", "Start runners for a repository"))
+	root.AddCommand(newUpCmd())
 	root.AddCommand(stubCmd("cleanup", "Remove leftover runners and sandboxes"))
 	return root
 }
