@@ -14,18 +14,26 @@ import (
 	"github.com/arteven/gh-runners-msb/internal/github"
 	"github.com/arteven/gh-runners-msb/internal/guest"
 	"github.com/arteven/gh-runners-msb/internal/identity"
+	"github.com/arteven/gh-runners-msb/internal/msbprofile"
 	"github.com/arteven/gh-runners-msb/internal/spec"
 )
 
+// MsbInstallCmd is how a user installs msb (microsandbox README, v0.8.2). The
+// extension itself never installs or upgrades it.
+const MsbInstallCmd = "curl -fsSL https://install.microsandbox.dev | sh"
+
 // Config is everything one Pool needs.
 type Config struct {
-	Slots     int
-	Label     string
-	Repo      string // shown in the banner: OWNER/REPO, or HOST/OWNER/REPO off github.com
-	Identity  identity.Pool
-	Sizes     spec.Sizes
-	Image     string
-	GitHub    github.Port
+	Slots    int
+	Label    string
+	Repo     string // shown in the banner: OWNER/REPO, or HOST/OWNER/REPO off github.com
+	Identity identity.Pool
+	Sizes    spec.Sizes
+	Image    string
+	GitHub   github.Port
+	// Backend is the resolved msb Backend, shown in the banner. Sandboxes must
+	// already be a context pinned to it.
+	Backend   msbprofile.Backend
 	Sandboxes *microsandbox.Sandboxes
 	Out, Err  io.Writer
 	// RetryDelay is the fixed wait after a failed iteration (default 5 s).
@@ -40,8 +48,9 @@ const (
 )
 
 // Run fills all Slots together and refills each as its Runner exits. It
-// returns nil once ctx is cancelled and every Slot has cleaned up.
-func Run(ctx context.Context, cfg Config) error {
+// returns nil once ctx is cancelled and every Slot has cleaned up, or the
+// fatal error that stopped the Pool (see runner.fatal).
+func Run(parent context.Context, cfg Config) error {
 	if cfg.Slots < 1 {
 		return errors.New("pool needs at least one slot")
 	}
@@ -60,22 +69,42 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	con := &console{out: cfg.Out, err: cfg.Err, now: now}
 
-	p := &runner{cfg: cfg, con: con, spec: spec.Local(cfg.Sizes, cfg.Image, cfg.Identity.ID)}
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(nil)
+	p := &runner{cfg: cfg, con: con, spec: spec.Local(cfg.Sizes, cfg.Image, cfg.Identity.ID), cancel: cancel}
 	con.info("pool", "Maintaining %d slots for %s; label %s", cfg.Slots, cfg.Repo, cfg.Label)
+	con.info("pool", "backend: %s", cfg.Backend)
 
 	var wg sync.WaitGroup
 	for slot := 1; slot <= cfg.Slots; slot++ {
 		wg.Go(func() { p.slot(ctx, slot) })
 	}
 	wg.Wait()
+	// A parent cancellation (Ctrl-C) is a clean stop; only our own fatal is an error.
+	var f *fatalError
+	if errors.As(context.Cause(ctx), &f) {
+		return f.err
+	}
 	return nil
 }
 
 type runner struct {
-	cfg  Config
-	con  *console
-	spec spec.Spec
+	cfg    Config
+	con    *console
+	spec   spec.Spec
+	cancel context.CancelCauseFunc
 }
+
+// fatalError marks the cause of a Pool-wide stop, so Run can tell it from a
+// parent cancellation.
+type fatalError struct{ err error }
+
+func (e *fatalError) Error() string { return e.err.Error() }
+func (e *fatalError) Unwrap() error { return e.err }
+
+// fatal stops every Slot, and Run returns err once they have cleaned up. The
+// first call wins.
+func (p *runner) fatal(err error) { p.cancel(&fatalError{err}) }
 
 func (p *runner) slot(ctx context.Context, n int) {
 	who := fmt.Sprintf("slot %d", n)
@@ -98,6 +127,10 @@ func (p *runner) iterate(ctx context.Context, n int, who string) error {
 	// creates are handled by a later ticket (#36).
 	sb, err := p.cfg.Sandboxes.Create(context.WithoutCancel(ctx), name, p.spec.Options()...)
 	if err != nil {
+		// Backstop for the CLI's pre-check: msb vanished after it passed.
+		if microsandbox.IsKind(err, microsandbox.ErrRuntimeNotInstalled) {
+			p.fatal(fmt.Errorf("msb is not installed; install it with: %s", MsbInstallCmd))
+		}
 		return fmt.Errorf("create %s: %w", name, err)
 	}
 
