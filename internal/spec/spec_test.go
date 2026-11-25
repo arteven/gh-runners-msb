@@ -26,14 +26,39 @@ func TestLocalDefaults(t *testing.T) {
 	}
 }
 
-func TestOptionsBuild(t *testing.T) {
-	opts := Local(Defaults, "img:1", "abc123").Options()
-	if len(opts) == 0 {
-		t.Fatal("no options")
+func TestLocalFollowsSizes(t *testing.T) {
+	got := Local(Sizes{CPUs: 4, MemoryMiB: 8192, DiskMiB: 20480, DockerMiB: 10240}, "img:1", "abc123")
+	if got.CPUs != 4 || got.MemoryMiB != 8192 || got.RootMiB != 10240 || got.DockerMiB != 10240 {
+		t.Errorf("got %+v", got)
 	}
-	for i, o := range opts {
+}
+
+func TestOptionsCarrySizes(t *testing.T) {
+	sizes := Sizes{CPUs: 4, MemoryMiB: 8192, DiskMiB: 20480, DockerMiB: 6144}
+	var cfg microsandbox.SandboxConfig
+	for i, o := range Local(sizes, "img:1", "abc123").Options() {
 		if o == nil {
-			t.Errorf("option %d is nil", i)
+			t.Fatalf("option %d is nil", i)
 		}
+		o(&cfg)
+	}
+	if cfg.CPUs != 4 {
+		t.Errorf("CPUs = %d, want 4", cfg.CPUs)
+	}
+	if cfg.MemoryMiB != 8192 {
+		t.Errorf("MemoryMiB = %d, want 8192", cfg.MemoryMiB)
+	}
+	if cfg.RootDisk == nil || cfg.RootDisk.SizeMiB != 14336 { // 20 GiB - 6 GiB
+		t.Errorf("RootDisk = %+v, want SizeMiB 14336", cfg.RootDisk)
+	}
+	vol, ok := cfg.Volumes["/var/lib/docker"]
+	if !ok {
+		t.Fatalf("no /var/lib/docker volume in %+v", cfg.Volumes)
+	}
+	if vol.SizeMiB != 6144 {
+		t.Errorf("docker volume SizeMiB = %d, want 6144", vol.SizeMiB)
+	}
+	if vol.Owned != string(microsandbox.VolumeKindDisk) {
+		t.Errorf("docker volume Owned = %q, want %q", vol.Owned, microsandbox.VolumeKindDisk)
 	}
 }
