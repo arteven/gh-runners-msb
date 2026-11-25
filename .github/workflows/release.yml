@@ -173,7 +173,7 @@ jobs:
         run: |
           max=$(objdump -T "dist/$ASSET" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
           echo "Highest glibc symbol version: $max"
-          if ! printf '%s\n' GLIBC_2.34 "$max" | sort -V -C; then
+          if ! printf '%s\n' "$max" GLIBC_2.34 | sort -V -C; then
             echo "::error::$ASSET needs $max, above the GLIBC_2.34 floor. Do not raise the floor here; report it on the parent spec (#23)."
             exit 1
           fi
