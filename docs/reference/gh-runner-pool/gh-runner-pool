@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Maintain five disposable microsandbox GitHub runners with private Docker daemons.
+
+Requirements: Linux/macOS local msb backend, GitHub CLI authenticated on the HOST,
+Python 3.10+. Private owned disks require the local backend.
+Repository auth: admin access; fine-grained PAT needs Administration: write.
+
+The Dockerfile is embedded. On first startup, the script extracts it to a private
+/tmp directory, builds the image using HOST Docker, and imports it into msb.
+Later startups reuse the cached image. VMs use the ordinary layered root and
+a private ext4 disk at /var/lib/docker, avoiding flat-root materialization.
+The image uses the expanded docker.io/library reference for import and creation.
+An existing msb-actions-docker:local cache entry is migrated to that reference
+automatically without rebuilding the image.
+The temporary build directory and image archive are removed after preparation.
+No apt/package installation runs per VM. Host Docker is needed only to build.
+Use --rebuild-image when updating the runner base or embedded Dockerfile.
+Use --image IMAGE to use an already prepared custom image instead of auto-build.
+Image preparation logs are saved with the worker logs as build-image.log.
+
+    gh auth login --hostname github.com
+    cd /path/to/your/repository
+    python3 /path/to/runner-pool.py
+
+Omit --repo to detect the GitHub repository from the current working directory.
+Pass --repo OWNER/REPOSITORY to override detection. Only github.com is supported.
+
+Workflow routing: runs-on: [self-hosted, msb-docker]
+Defaults: five slots, 2 vCPUs / 4 GiB RAM / 5 GiB disk per VM.
+The 5 GiB writable budget is split into 3 GiB root/workspace and 2 GiB Docker
+data. The cached read-only image layers are shared. --disk sets the total budget;
+--docker-disk sets the Docker share, and the remainder is the writable root.
+Keep this process running under systemd for unattended operation across reboots.
+Example /etc/systemd/system/msb-runner-pool.service on Linux (adjust user/paths):
+
+    [Unit]
+    Description=Microsandbox GitHub runner pool
+    Wants=network-online.target
+    After=network-online.target
+
+    [Service]
+    User=YOUR_LINUX_USER
+    WorkingDirectory=/path/to/your/repository
+    Environment=PATH=/home/YOUR_LINUX_USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+    ExecStart=/usr/bin/python3 /opt/msb-runner-pool/runner-pool.py --workers 5 --disk 5G
+    Restart=always
+    RestartSec=10
+    KillMode=mixed
+    TimeoutStopSec=240
+
+    [Install]
+    WantedBy=multi-user.target
+
+The service user needs working msb and gh auth under that same account.
+Set WorkingDirectory to the repository checkout when omitting --repo.
+Ensure the service user can write to the --logs directory.
+After installing the unit: sudo systemctl daemon-reload
+Then: sudo systemctl enable --now msb-runner-pool
+View logs: journalctl -u msb-runner-pool -f
+
+SIGINT/SIGTERM stops the pool and cancels running jobs; it does not drain them.
+Each finished/crashed runner is destroyed, including its Docker cache, then replaced.
+Only temporary JIT credentials enter the guest; host gh credentials stay on host.
+CLI/global sandbox lifetime policies still apply. No 1h lifetime is set here.
+
+Logs default to /tmp/msb-runner-pool: one host log per VM, plus copied runner
+diagnostics and dockerd log. Override with --logs PATH when needed.
+These temporary logs may be removed on reboot or by system cleanup.
+An abrupt kill or power loss may leave VMs/offline registrations to remove manually.
+No VM runtime or live GitHub job was available to integration-test this script.
+
+Sources checked 2026-10-07:
+https://docs.microsandbox.dev/examples/ci-cd/github-actions-runner
+https://docs.microsandbox.dev/examples/docker/docker-in-sandbox
+https://docs.microsandbox.dev/cli/sandbox-commands
+https://docs.github.com/en/rest/actions/self-hosted-runners
+https://raw.githubusercontent.com/actions/runner/main/images/Dockerfile
+"""
+
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import urlparse
+
+
+LEGACY_IMAGE = 'msb-actions-docker:local'
+DEFAULT_IMAGE = 'docker.io/library/msb-actions-docker:local'
+DOCKERFILE = r"""ARG RUNNER_IMAGE=ghcr.io/actions/actions-runner:latest
+FROM ${RUNNER_IMAGE}
+
+USER root
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables \
+    && update-alternatives --set iptables /usr/sbin/iptables-legacy \
+    && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+    && usermod -aG docker runner \
+    && command -v docker \
+    && command -v dockerd \
+    && docker buildx version \
+    && rm -rf /var/lib/apt/lists/*
+
+USER runner
+WORKDIR /home/runner
+"""
+
+
+# The prebuilt image includes Docker, Buildx, iptables, and runner group membership.
+# Startup only launches the daemon and listener; it never installs packages.
+RUNNER_START = r"""
+set -euo pipefail
+IFS= read -r config
+export DOCKER_HOST=unix:///var/run/docker.sock
+export ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1
+export RUNNER_MANUALLY_TRAP_SIG=0
+sudo dockerd --host="$DOCKER_HOST" --group=docker >/tmp/dockerd.log 2>&1 &
+daemon_pid=$!
+runner_pid=''
+cleanup() {
+  [ -z "$runner_pid" ] || kill "$runner_pid" 2>/dev/null || true
+  sudo kill "$daemon_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+ready=false
+for ((i=0; i<90; i++)); do
+  if docker info >/dev/null 2>&1; then ready=true; break; fi
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then break; fi
+  sleep 1
+done
+if [ "$ready" != true ]; then cat /tmp/dockerd.log; exit 1; fi
+echo 'Docker ready; starting GitHub listener'
+./run.sh --jitconfig "$config" &
+runner_pid=$!
+unset config
+# Whichever exits first ends this VM's lifecycle; host replaces the whole VM.
+set +e
+wait -n "$daemon_pid" "$runner_pid"
+status=$?
+set -e
+if kill -0 "$runner_pid" 2>/dev/null; then
+  echo 'Docker daemon stopped while runner was active'
+  cat /tmp/dockerd.log
+  exit 1
+fi
+exit "$status"
+"""
+
+class Stopping(Exception):
+    pass
+
+
+def announce(slot, message):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [slot {slot}] {message}", flush=True)
+
+
+async def terminate(proc):
+    if proc.returncode is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+
+
+async def command(argv, stop, *, data=None, log=None, timeout=None, cleanup=False, env=None):
+    log_start = log.tell() if log else None
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
+        stdout=log if log else asyncio.subprocess.PIPE,
+        stderr=log if log else asyncio.subprocess.PIPE,
+        env=env,
+    )
+    communication = asyncio.create_task(proc.communicate(data))
+    stopped = asyncio.create_task(stop.wait())
+    try:
+        watchers = [communication] if cleanup else [communication, stopped]
+        done, _ = await asyncio.wait(watchers, timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if communication not in done:
+            await terminate(proc)
+            await communication
+            if stop.is_set() and not cleanup:
+                raise Stopping()
+            raise RuntimeError(f"{argv[0]} {argv[1]} timed out")
+        out, err = await communication
+        if proc.returncode:
+            # Do not expose stdout: a JIT API response contains credentials.
+            detail = (err or b'').decode(errors='replace').strip()
+            if log:
+                # Both subprocess streams went to the log, so communicate() returned
+                # no stderr. Report this command's recent output, not earlier runs.
+                log.flush()
+                with open(log.name, 'rb') as saved:
+                    saved.seek(0, os.SEEK_END)
+                    saved.seek(max(log_start, saved.tell() - 8192))
+                    recent = saved.read().decode(errors='replace').strip()
+                detail = f'Log: {log.name}'
+                if recent:
+                    detail += '\n' + '\n'.join(recent.splitlines()[-40:])
+            raise RuntimeError(f"{argv[0]} {argv[1]} exited {proc.returncode}: {detail}")
+        return (out or b'').decode()
+    finally:
+        stopped.cancel()
+        await terminate(proc)
+
+
+async def worker(slot, args, stop):
+    failures = 0
+    while not stop.is_set():
+        name = f"msb-gh-{slot}-{uuid.uuid4().hex[:12]}"
+        runner_id = None
+        started = time.monotonic()
+        log_path = args.logs / f"{name}.log"
+        with log_path.open('ab', buffering=0) as log:
+            try:
+                announce(slot, f"Creating {name}; log {log_path}")
+                await command(['msb', 'create', args.image, '--name', name,
+                               '--cpus', str(args.cpus), '--memory', args.memory,
+                               '--root-disk', args.root_disk,
+                               '--mount-owned', f'/var/lib/docker:kind=disk,size={args.docker_disk}',
+                               '--net', 'public'],
+                              stop, log=log, timeout=600)
+                registration = json.loads(await command([
+                    'gh', 'api', '--hostname', 'github.com', '--method', 'POST',
+                    f'repos/{args.repo}/actions/runners/generate-jitconfig',
+                    '-f', f'name={name}', '-F', f'runner_group_id={args.group}',
+                    '-f', 'labels[]=self-hosted', '-f', f'labels[]={args.label}',
+                    '-f', 'work_folder=_work'], stop, timeout=60))
+                runner_id = int(registration['runner']['id'])
+                config = registration.pop('encoded_jit_config')
+                announce(slot, f'{name}: registered; starting Docker and GitHub listener')
+                await command(
+                    ['msb', 'exec', '--stream', '--user', 'runner',
+                     '--workdir', '/home/runner', name, '--', 'bash', '-lc', RUNNER_START],
+                    stop, data=(config + '\n').encode(), log=log)
+                del config, registration
+                announce(slot, f'{name}: runner finished; replacing VM')
+                failures = 0
+            except Stopping:
+                pass
+            except Exception as exc:
+                announce(slot, f'{name}: {exc}')
+                failures = failures + 1 if time.monotonic() - started < 120 else 1
+            finally:
+                # Save diagnostic files before deleting the guest. Do not save JIT config.
+                for source, destination in [('/home/runner/_diag', args.logs / f'{name}-diag'),
+                                             ('/tmp/dockerd.log', args.logs / f'{name}-dockerd.log')]:
+                    try:
+                        await command(['msb', 'cp', f'{name}:{source}', str(destination)],
+                                      stop, cleanup=True, log=log, timeout=20)
+                    except Exception:
+                        pass
+                try:
+                    await command(['msb', 'rm', '-f', name], stop, cleanup=True,
+                                  log=log, timeout=60)
+                except Exception as exc:
+                    if 'not found' not in str(exc).lower():
+                        announce(slot, f'VM cleanup failed for {name}: {exc}')
+                        # Do not accumulate replacement VMs if removal is broken.
+                        stop.set()
+                if runner_id is not None:
+                    try:
+                        await command(['gh', 'api', '--hostname', 'github.com', '--method', 'DELETE',
+                                       f'repos/{args.repo}/actions/runners/{runner_id}'],
+                                      stop, cleanup=True, timeout=30)
+                    except Exception as exc:
+                        if 'HTTP 404' not in str(exc):
+                            announce(slot, f'GitHub cleanup failed for runner {runner_id}: {exc}')
+        if failures:
+            await wait_delay(stop, min(60, 2 ** min(failures, 6)) + random.random())
+
+
+async def wait_delay(stop, seconds):
+    try:
+        await asyncio.wait_for(stop.wait(), seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def main(args):
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(signum, stop.set)
+    # Fail before provisioning if host authentication is unavailable.
+    await command(['gh', 'auth', 'status', '--hostname', 'github.com'], stop, timeout=30)
+    if args.repo is None:
+        args.repo = await detect_repo(stop)
+    await ensure_image(args, stop)
+    announce('-', f'Maintaining {args.workers} slots for {args.repo}; label {args.label}')
+    await asyncio.gather(*(worker(i, args, stop) for i in range(1, args.workers + 1)))
+
+
+async def ensure_image(args, stop):
+    automatic = args.image is None
+    if automatic:
+        args.image = DEFAULT_IMAGE
+    needs_build = automatic and args.rebuild_image
+    needs_alias = False
+    if automatic and not needs_build:
+        try:
+            await command(['msb', 'image', 'inspect', args.image], stop, timeout=30)
+            announce('-', f'Reusing cached image {args.image}')
+        except RuntimeError:
+            # Imports may preserve short names while VM creation expands them.
+            # Register the same expanded reference that the runtime resolves.
+            try:
+                await command(['msb', 'image', 'inspect', LEGACY_IMAGE], stop, timeout=30)
+                needs_alias = True
+            except RuntimeError:
+                needs_build = True
+    with (args.logs / 'build-image.log').open('ab', buffering=0) as log:
+        if needs_alias:
+            announce('-', f'Adding expanded cache alias {args.image} from {LEGACY_IMAGE}')
+            with tempfile.TemporaryDirectory(prefix='msb-runner-alias-', dir='/tmp') as temp:
+                archive = Path(temp) / 'runner-image.tar'
+                await command(['msb', 'save', '--output', str(archive), LEGACY_IMAGE],
+                              stop, log=log, timeout=600)
+                await command(['msb', 'load', '--input', str(archive), '--tag', args.image],
+                              stop, log=log, timeout=600)
+        if needs_build:
+            if not shutil.which('docker'):
+                raise RuntimeError('Host Docker is required for the first image build. '
+                                   'Install/start Docker, or use --image with a prepared image.')
+            announce('-', f'Building {args.image} once; log {args.logs / "build-image.log"}')
+            with tempfile.TemporaryDirectory(prefix='msb-runner-build-', dir='/tmp') as temp:
+                build_dir = Path(temp)
+                dockerfile = build_dir / 'Dockerfile'
+                dockerfile.write_text(DOCKERFILE)
+                archive = build_dir / 'runner-image.tar'
+                await command(['docker', 'buildx', 'build', '--load', '--pull', '-f', str(dockerfile),
+                               '-t', args.image, str(build_dir)], stop, log=log, timeout=1800)
+                await command(['docker', 'save', '--output', str(archive), args.image],
+                              stop, log=log, timeout=600)
+                await command(['msb', 'load', '--input', str(archive), '--tag', args.image],
+                              stop, log=log, timeout=600)
+        if needs_build or needs_alias:
+            try:
+                await command(['msb', 'image', 'inspect', args.image], stop,
+                              log=log, timeout=30)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f'Image import finished, but msb cannot find {args.image} '
+                    'in the current account\'s image cache. Check msb images '
+                    'and msb --version under the service account.\n'
+                    f'{exc}') from exc
+        # Ordinary layered roots can use this imported image directly.
+        # Docker stores its overlay layers on its own private ext4 disk.
+        announce('-', f'Image ready: {args.image}; creating VMs from it directly')
+
+
+async def detect_repo(stop):
+    # GH_REPO would override cwd discovery. Keep host credentials available.
+    env = os.environ.copy()
+    env.pop('GH_REPO', None)
+    env['GH_HOST'] = 'github.com'
+    env['GH_PROMPT_DISABLED'] = '1'
+    try:
+        result = json.loads(await command(
+            ['gh', 'repo', 'view', '--json', 'nameWithOwner,url'],
+            stop, timeout=30, env=env))
+        repo = result['nameWithOwner']
+        if (urlparse(result['url']).hostname != 'github.com'
+                or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)):
+            raise ValueError('The detected repository is not a github.com repository')
+        return repo
+    except Stopping:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            'Could not detect a github.com repository from the current working '
+            'directory. Run from its Git checkout or pass --repo OWNER/REPOSITORY. '
+            f'Details: {exc}') from exc
+
+
+def disk_mib(value):
+    match = re.fullmatch(r'([1-9][0-9]*)([MGT])(?:I?B)?', value.upper())
+    if not match:
+        raise ValueError('disk sizes must be positive integers with M/G/T units, e.g. 512M or 5G')
+    return int(match[1]) * {'M': 1, 'G': 1024, 'T': 1024 ** 2}[match[2]]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--repo', help='OWNER/REPOSITORY (github.com); default: detect from cwd')
+    parser.add_argument('--workers', type=int, default=5)
+    parser.add_argument('--cpus', type=int, default=2)
+    parser.add_argument('--memory', default='4G')
+    parser.add_argument('--disk', default='5G', help='Total writable disk budget per VM (default: 5G)')
+    parser.add_argument('--docker-disk', default='2G', help='Docker share of --disk (default: 2G)')
+    parser.add_argument('--label', default='msb-docker')
+    parser.add_argument('--group', type=int, default=1)
+    parser.add_argument('--image', help='Use a custom Docker-ready image; default: auto-build embedded Dockerfile')
+    parser.add_argument('--rebuild-image', action='store_true',
+                        help='Rebuild and reimport the embedded image even when cached')
+    parser.add_argument('--logs', type=Path, default=Path('/tmp/msb-runner-pool'))
+    args = parser.parse_args()
+    if args.repo is not None and not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo):
+        parser.error('--repo must be OWNER/REPOSITORY')
+    if args.image is not None and args.rebuild_image:
+        parser.error('--rebuild-image cannot be combined with --image')
+    if min(args.workers, args.cpus, args.group) < 1:
+        parser.error('--workers, --cpus and --group must be positive')
+    try:
+        total_mib = disk_mib(args.disk)
+        docker_mib = disk_mib(args.docker_disk)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if docker_mib >= total_mib:
+        parser.error('--docker-disk must be smaller than --disk to leave room for the root/workspace')
+    args.root_disk = f'{total_mib - docker_mib}M'
+    args.docker_disk = f'{docker_mib}M'
+    for executable in ('gh', 'msb'):
+        if not shutil.which(executable):
+            parser.error(f'{executable} is not installed or not on PATH')
+    args.logs = args.logs.resolve()
+    args.logs.mkdir(parents=True, exist_ok=True)
+    return args
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main(parse_args()))
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f'Pool stopped: {exc}', file=sys.stderr)
+        sys.exit(1)
