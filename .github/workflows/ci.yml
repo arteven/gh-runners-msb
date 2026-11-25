@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  # No branch filter: PRs into stacked parent branches run too, not only master.
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    env:
+      # The msb SDK needs cgo; never build without it.
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+      - name: Build
+        run: go build -ldflags "-X main.version=v0.0.0-ci" -o gh-runners-msb .
+
+      - name: Smoke --version (proves ldflags stamping and FFI load)
+        run: |
+          out=$(./gh-runners-msb --version)
+          echo "$out"
+          grep -q 'v0.0.0-ci' <<<"$out"
+
+      - name: Smoke as a gh extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh extension install .
+          gh runners-msb --version
+
+  # Drives the Pool in-process with the fake GitHub port and real local msb
+  # microVMs. No secrets, so it also runs on fork PRs.
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Always built from image/, never pulled: the published :1 may not exist
+      # yet (or be private), and the test must not depend on it.
+      - name: Base Runner image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v=$(gh api repos/actions/runner/releases/latest --jq .tag_name)
+          docker build --build-arg "RUNNER_VERSION=${v#v}" -t runner-base:it image/
+
+      - name: Build and save the stand-in runner image
+        run: |
+          docker build --build-arg BASE=runner-base:it -t runner-it:ci internal/pool/testdata/fake-runner
+          docker save -o "$RUNNER_TEMP/it.tar" runner-it:ci
+
+      # Non-conforming: no dockerd, so the Self-test must fail.
+      - name: Build and save the broken image
+        run: |
+          docker build --build-arg BASE=runner-base:it -t runner-bad:ci internal/pool/testdata/broken-runner
+          docker save -o "$RUNNER_TEMP/bad.tar" runner-bad:ci
+
+      - name: Integration test
+        env:
+          INTEGRATION_IMAGE_TAR: ${{ runner.temp }}/it.tar
+          INTEGRATION_BAD_IMAGE_TAR: ${{ runner.temp }}/bad.tar
+        run: go test -tags integration -timeout 20m -v ./internal/pool/
