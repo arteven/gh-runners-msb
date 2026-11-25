@@ -1,0 +1,17 @@
+# Dependabot reads this file from the default branch only.
+#
+# SDK bumps (ADR-0004): each microsandbox SDK bump is its own PR (gomod is
+# deliberately ungrouped). Before merging, diff config/backend.rs,
+# persistence.rs, mod.rs and context/profile.rs between the two upstream tags.
+# go.mod requirements are exact versions, so bumps are exact too. Indirect
+# deps (sdk/go/core) move with sdk/go, so only direct ones are watched.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: weekly }
+    allow: [{ dependency-type: direct }]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups: { actions: { patterns: ["*"] } }
